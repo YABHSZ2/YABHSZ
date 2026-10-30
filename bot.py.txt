@@ -1,0 +1,149 @@
+import os
+from datetime import datetime, timedelta
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message, FSInputFile
+from openai import OpenAI
+
+# 1. إعدادات المفاتيح (ضع رموزك الحقيقية هنا)
+TELEGRAM_TOKEN = "8840138167:AAEFj5Gb31P_vn3IqmZV5XBPxQvKl44EevU"
+OPENAI_API_KEY = "AQ.Ab8RN6L8_0zIl60rgC6E2Q8aTxRdMr2NfC1EiVxqQ7Ix_NSy9A"
+
+# تهيئة البوت ومستمع الأحداث
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+# تهيئة عميل OpenAI الجديد لعام 2026
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# 2. قاعدة بيانات المشتركين المؤقتة
+USERS_DB = {}
+
+# توجيه النظام (System Prompt) لتعليم الفارسية العامية والدراجة
+SYSTEM_INSTRUCTIONS = (
+    "أنت معلم لغة فارسية محترف ومحاكي فائق الذكاء للمواقف اليومية في إيران. "
+    "وظيفتك إدارة محاكاة حية (Role-play) مع المتعلم داخل (متاجر، مطاعم، مواصلات، معاملات بنكية). "
+    "تحدث بالفارسية الدارجة (المحكية في الشارع) وترجم العبارات الصعبة للعربية عند الحاجة. "
+    "قم بتصحيح أخطاء القواعد والنطق بلطف. "
+    "في نهاية كل 5 محادثات، قم بتقييم مستوى المتعلم بناءً على أدائه ومفرداته وإعطائه درجة من 100."
+)
+
+# دالة فحص صلاحية الاشتراك
+def is_subscription_valid(user_id: str) -> bool:
+    user = USERS_DB.get(str(user_id))
+    if not user or not user["is_paid"]:
+        return False
+    if datetime.now() > user["expiry_date"]:
+        user["is_paid"] = False 
+        return False
+    return True
+
+# 3. استقبال أمر البداية /start
+@dp.message(Command("start"))
+async def send_welcome(message: Message):
+    user_id = str(message.from_user.id)
+    
+    # تفعيل تلقائي للمستخدم للتجربة (صالح لمدة شهر)
+    if user_id not in USERS_DB:
+        USERS_DB[user_id] = {
+            "is_paid": True, 
+            "expiry_date": datetime.now() + timedelta(days=30),
+            "score": 100,
+            "chat_history": []
+        }
+
+    await message.reply(
+        "👋 خوش آمدید! مرحباً بك في مساعدك الفارسية الذكي الفائق.\n\n"
+        "🎯 أنا الآن محاكٍ ذكي؛ تخيل أننا في متجر وسط طهران وتريد الشراء. "
+        "يمكنك الكتابة لي أو إرسال **رسالة صوتية** مباشرة بالفارسية لأسمعك وأصحح لك!"
+    )
+
+# 4. استقبال ومعالجة الصوت (الاستماع والنطق الآلي)
+@dp.message(lambda msg: msg.voice is not None)
+async def handle_voice(message: Message):
+    user_id = str(message.from_user.id)
+    if not is_subscription_valid(user_id):
+        await message.reply("⚠️ انتهت مدة الاشتراك. يرجى التجديد للاستمرار.")
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="record_voice")
+
+    voice_file = await bot.get_file(message.voice.file_id)
+    voice_path = f"{user_id}_input.ogg"
+    await bot.download_file(voice_file.file_path, voice_path)
+
+    try:
+        # تحويل الصوت إلى نص باستخدام Whisper المحدث
+        with open(voice_path, "rb") as audio:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio
+            )
+        
+        user_text = transcript.text
+        
+        # توليد رد الذكاء الاصطناعي
+        reply_text = await generate_ai_response(user_id, user_text)
+        
+        # تحويل رد الذكاء الاصطناعي إلى صوت نقي (TTS)
+        reply_audio_path = f"{user_id}_response.mp3"
+        response_audio = client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=reply_text
+        )
+        response_audio.stream_to_file(reply_audio_path)
+
+        # إرسال النتيجة للمستخدم
+        await message.reply(f"✍️ نطقك المترجم نصياً: {user_text}\n\n💡 الرد المكتوب: {reply_text}")
+        await message.reply_voice(FSInputFile(reply_audio_path))
+
+        # تنظيف الملفات المؤقتة من الهاتف
+        if os.path.exists(voice_path): os.remove(voice_path)
+        if os.path.exists(reply_audio_path): os.remove(reply_audio_path)
+
+    except Exception as e:
+        await message.reply("حدث خطأ أثناء معالجة الصوت، يرجى المحاولة نصياً.")
+        print(f"Error: {e}")
+
+# 5. معالجة الرسائل النصية
+@dp.message()
+async def handle_text(message: Message):
+    user_id = str(message.from_user.id)
+    if not is_subscription_valid(user_id):
+        await message.reply("⚠️ انتهت فترة اشتراكك. يرجى التجديد لتفعيل الحساب.")
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    reply_text = await generate_ai_response(user_id, message.text)
+    await message.reply(reply_text)
+
+# 6. توليد الرد وحساب التقييم المستمر
+async def generate_ai_response(user_id: str, user_text: str) -> str:
+    user_data = USERS_DB[user_id]
+    user_data["chat_history"].append({"role": "user", "content": user_text})
+    
+    messages = [{"role": "system", "content": SYSTEM_INSTRUCTIONS}] + user_data["chat_history"][-10:]
+    
+    # استدعاء نموذج التحدث المحدث gpt-4o
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages
+    )
+    
+    bot_reply = response.choices[0].message.content
+    user_data["chat_history"].append({"role": "assistant", "content": bot_reply})
+    
+    # التقييم التلقائي كل 5 جمل
+    if len(user_data["chat_history"]) % 6 == 0:
+        bot_reply += f"\n\n📊 **التقييم الفوري لمستواك:** تم تحليل محادثتك، وتقييم أدائك الحالي في هذا الموقف هو {user_data['score']}/100 بناءً على المفردات الدارجة المستخدمة!"
+        
+    return bot_reply
+
+async def main():
+    print("🚀 البوت يعمل الآن بالكود المحدث بنجاح...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
